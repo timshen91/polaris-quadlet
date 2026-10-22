@@ -1,9 +1,9 @@
 [Unit]
 Description=Polaris game stream host (rootless podman)
-After=graphical-session.target pipewire.service
-# Restart with the session so a Game/Desktop Mode switch re-reads the display.
-PartOf=graphical-session.target
-Wants=pipewire.service
+# As upstream's polaris.service: ordering only, deliberately without
+# PartOf=graphical-session.target, so the host outlives Game/Desktop Mode
+# switches and an active stream is not cut by a session ending.
+After=graphical-session.target
 StartLimitIntervalSec=500
 StartLimitBurst=5
 
@@ -18,6 +18,9 @@ GroupAdd=keep-groups
 Network=host
 # Host /proc: Polaris detects Game Mode and tracks Steam by scanning processes.
 PodmanArgs=--pid=host --ipc=host
+# Upstream's PassEnvironment=: --env NAME copies each from this unit's
+# environment (the user manager's) and skips it when unset.
+PodmanArgs=--env WAYLAND_DISPLAY --env DISPLAY --env XDG_CURRENT_DESKTOP --env XDG_SESSION_TYPE --env XDG_SESSION_ID --env XAUTHORITY --env XDG_RUNTIME_DIR --env DBUS_SESSION_BUS_ADDRESS
 SecurityLabelDisable=true
 AddDevice=/dev/dri
 AddDevice=/dev/uinput
@@ -34,25 +37,25 @@ Volume=polaris-labwc:%h/.config/labwc-polaris:U
 Volume=%h/.steam:%h/.steam:ro
 Volume=%h/.local/share/Steam:%h/.local/share/Steam:ro
 Environment=HOME=%h
-Environment=XDG_RUNTIME_DIR=%t
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
-# Host compositor for Private Stream (GPU-native), which runs labwc windowed in it.
-EnvironmentFile=%t/polaris-display.env
 
 [Service]
-# Game Mode: gamescope-0 (not in the user manager env, so read gamescope's file).
-# Desktop Mode: Plasma exports WAYLAND_DISPLAY/DISPLAY to the user manager.
-# Test for a live gamescope: it leaves its socket and env file behind on exit.
-ExecStartPre=/bin/sh -c 'if pgrep -u %U -x "gamescope|gamescope-wl" >/dev/null; then echo WAYLAND_DISPLAY=gamescope-0; grep -E "^(DISPLAY|XDG_CURRENT_DESKTOP)=" %t/gamescope-environment; else env | grep -E "^(WAYLAND_DISPLAY|DISPLAY|XDG_CURRENT_DESKTOP)="; fi > %t/polaris-display.env; true'
+# Avoid starting Polaris before the desktop is fully initialized.
+ExecStartPre=/bin/sleep 5
 Restart=on-failure
 RestartSec=5s
 SuccessExitStatus=75
 RestartForceExitStatus=75
 TimeoutStartSec=900
+# Give capture, encode, and audio workers room to request realtime or
+# negative-nice priority when the user manager allows it.
+LimitRTPRIO=95
+LimitNICE=-10
 
 [Install]
-# Activated by both Game Mode (gamescope-session) and Desktop Mode (Plasma).
-WantedBy=graphical-session.target
+# Upstream's desktop autostart, plus its --enable-headless-boot hook (with
+# lingering) so Polaris also runs at boot for Game Mode.
+WantedBy=xdg-desktop-autostart.target
+WantedBy=default.target
 
 [Quadlet]
 # SteamOS never activates network-online.target; skip podman's 90s wait for it.

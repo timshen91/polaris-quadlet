@@ -7,10 +7,13 @@ FROM docker.io/library/archlinux:latest
 ARG POLARIS_VERSION=1.4.13
 ARG POLARIS_SHA256=cabab97cc37accb70553f7d27b038f122dd5e513d7632a2be5ec137e549b4b72
 
+# gamescope: only so Polaris offers Gamescope Stream (linux_stream_mode =
+# gamescope_stream); the session itself runs on the host (see below).
 # Intel and AMD VAAPI/QSV/Vulkan userspace for the encoder. (NVIDIA would need
 # nvidia-utils matching the host's driver version; not covered here.)
 RUN pacman -Syu --noconfirm \
       mesa intel-media-driver vpl-gpu-rt vulkan-intel vulkan-radeon \
+      gamescope \
  && curl -fsSL -o /tmp/polaris.pkg.tar.zst \
       "https://github.com/papi-ux/polaris/releases/download/v${POLARIS_VERSION}/Polaris-arch-x86_64.pkg.tar.zst" \
  && echo "${POLARIS_SHA256}  /tmp/polaris.pkg.tar.zst" | sha256sum -c - \
@@ -18,16 +21,14 @@ RUN pacman -Syu --noconfirm \
  && rm -f /tmp/polaris.pkg.tar.zst \
  && pacman -Scc --noconfirm
 
-# Polaris launches Steam titles by running `steam ...`. Forward that to the host's
-# /usr/bin/steam as a transient host user unit (via the mounted user bus), which
-# hands steam:// URLs and -applaunch to the already-running Steam client.
-# systemd-run drops the caller's env, so forward the display Polaris picked (its
-# Private Stream labwc) and the POLARIS_* tags it uses to find its own Steam.
-# In /usr/bin, not /usr/local/bin: Private Stream runs its command with PATH=/usr/bin:/bin.
-RUN printf '%s\n' '#!/bin/sh' \
-      'fwd=$(env | sed -n "s/^\(WAYLAND_DISPLAY\|DISPLAY\|XDG_CURRENT_DESKTOP\|POLARIS_[A-Za-z0-9_]*\|SDL_[A-Za-z0-9_]*\)=.*/-E \1/p")' \
-      'exec systemd-run --user --quiet --collect $fwd -- /usr/bin/steam "$@"' \
-      > /usr/bin/steam \
- && chmod 0755 /usr/bin/steam
+# Forward `steam ...` to the host's Steam client; see steam-forward.sh.
+COPY steam-forward.sh /usr/bin/steam
+RUN chmod 0755 /usr/bin/steam
+
+# Run the gamescope session script on the host; see gamescope-session-forward.sh.
+# The shipped copies stay in /usr/share/polaris/gamescope.
+COPY gamescope-session-forward.sh /usr/bin/polaris-gamescope-session
+COPY gamescope-ready-diag.sh /usr/share/polaris-host/gamescope-ready-diag.sh
+RUN chmod 0755 /usr/bin/polaris-gamescope-session
 
 ENTRYPOINT ["/usr/bin/polaris"]

@@ -4,8 +4,8 @@
 podman Quadlet on SteamOS. Everything lives under `~`; the read-only root is never
 unlocked.
 
-Tested on SteamOS 3.9 with an Intel GPU and Polaris 1.4.13. AMD userspace is
-included but untested; NVIDIA is not covered.
+Tested on SteamOS 3.9.3 with an AMD GPU (Strix Halo) and Polaris 1.4.13; an
+earlier revision was tested on Intel. NVIDIA is not covered.
 
 ## Files
 
@@ -14,7 +14,10 @@ Install into `~/.config/containers/systemd/`:
 | File | Purpose |
 |---|---|
 | `polaris.build` | Builds `localhost/polaris:latest` from the Containerfile. |
-| `polaris/Containerfile` | Arch Linux + the official Polaris Arch package + Intel/AMD VAAPI and Vulkan userspace, plus a `steam` wrapper that forwards to the host's Steam. |
+| `polaris/Containerfile` | Arch Linux + the official Polaris Arch package + Intel/AMD VAAPI and Vulkan userspace + gamescope (so Gamescope Stream is offered), plus the wrappers below. |
+| `polaris/steam-forward.sh` | Installed as the container's `/usr/bin/steam`; forwards to the host's Steam. |
+| `polaris/gamescope-session-forward.sh` | Installed as `/usr/bin/polaris-gamescope-session`; runs Polaris's shipped gamescope session script on the host. |
+| `polaris/gamescope-ready-diag.sh` | Debug aid appended to the host copy of the session lib; logs which ownership check failed on a readiness timeout. |
 | `polaris.container` | Runs Polaris: host network, host PID (Game Mode detection), `/dev/dri`, `/dev/uinput`, the user runtime dir (PipeWire, gamescope sockets, session bus). |
 | `polaris-config.volume` | Named volume for Polaris settings, credentials and pairings. |
 
@@ -30,8 +33,9 @@ systemctl --user daemon-reload
 systemctl --user start polaris-build polaris
 ```
 
-It starts with `graphical-session.target` (both Game Mode and Desktop Mode).
-Web UI: `https://<host>:47990`.
+It starts via `xdg-desktop-autostart.target` (Desktop Mode) and
+`default.target` (at boot, for Game Mode; enable lingering with
+`loginctl enable-linger`). Web UI: `https://<host>:47990`.
 
 ## Upgrade
 
@@ -43,15 +47,27 @@ systemctl --user restart polaris-build polaris
 
 ## How it fits together
 
-- **Display.** `ExecStartPre` writes `$XDG_RUNTIME_DIR/polaris-display.env`:
-  `gamescope-0` when a gamescope process is running (Game Mode), otherwise the
-  user manager's `WAYLAND_DISPLAY`/`DISPLAY` (Desktop Mode). `PartOf=` restarts
-  Polaris on a Game Mode / Desktop Mode switch so this is re-read.
-- **Steam.** Steam stays on the host. The container's `/usr/bin/steam` runs the
-  host's Steam via `systemd-run --user`, forwarding `WAYLAND_DISPLAY`, `DISPLAY`,
-  `POLARIS_*` and `SDL_*` so Private Stream launches land on Polaris's labwc.
-  It lives in `/usr/bin` because Private Stream runs commands with
-  `PATH=/usr/bin:/bin`.
+- **Unit.** Mirrors upstream's `polaris.service`: `After=graphical-session.target`
+  only, deliberately without `PartOf=`, so Polaris outlives Game/Desktop Mode
+  switches and an active stream is not cut. Upstream's `PassEnvironment=` is
+  emulated with `podman --env NAME` (copied from the user manager, skipped when
+  unset). `LimitRTPRIO`/`LimitNICE` let capture/encode/audio workers raise
+  priority.
+- **Steam.** Steam stays on the host. The container's `/usr/bin/steam`
+  (`steam-forward.sh`) runs the host's Steam via `systemd-run --user`,
+  forwarding the display Polaris picked plus `POLARIS_*`, `SDL_*`,
+  `GAMESCOPE_*`, `STEAM_*`, HDR and audio-sink vars, and unsetting whichever of
+  `WAYLAND_DISPLAY`/`DISPLAY` the caller lacks (headless gamescope has no
+  `WAYLAND_DISPLAY`). It lives in `/usr/bin` because Private Stream runs
+  commands with `PATH=/usr/bin:/bin`.
+- **Gamescope Stream.** Rootless podman's user namespace cannot read
+  `/proc/<pid>/exe` or `environ` of host processes, so Polaris's gamescope
+  session script fails its ownership checks in the container.
+  `gamescope-session-forward.sh` copies the shipped script and lib into
+  `$XDG_RUNTIME_DIR/polaris-host-gamescope/` and runs them unchanged on the host
+  via `systemd-run --user --wait`, with `POLARIS_GAMESCOPE_COMPOSITE_CURSOR=0`
+  (SteamOS's gamescope lacks `--pipewire-composite-cursor`) and a 90s readiness
+  timeout (Steam can take 30-45s to start).
 - **X11.** `/tmp/.X11-unix` is deliberately not mounted: labwc's Xwayland must own
   it, and `Network=host` already shares the host's abstract X sockets.
 
