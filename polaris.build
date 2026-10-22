@@ -1,0 +1,11 @@
+[Unit]
+Description=Build the Polaris container image
+
+[Build]
+ImageTag=localhost/polaris:latest
+File=%h/.config/containers/systemd/polaris/Containerfile
+SetWorkingDirectory=file
+
+[Quadlet]
+# SteamOS never activates network-online.target; skip podman's 90s wait for it.
+DefaultDependencies=false

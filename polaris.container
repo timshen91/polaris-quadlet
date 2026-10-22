@@ -1,0 +1,59 @@
+[Unit]
+Description=Polaris game stream host (rootless podman)
+After=graphical-session.target pipewire.service
+# Restart with the session so a Game/Desktop Mode switch re-reads the display.
+PartOf=graphical-session.target
+Wants=pipewire.service
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Container]
+Image=polaris.build
+ContainerName=polaris
+# Same uid as the host user: keeps the user's ACLs on /dev/uinput and /dev/dri/card*
+# and lets Polaris use the session's sockets.
+UserNS=keep-id
+GroupAdd=keep-groups
+# Moonlight/Nova ports and the web UI on 47990.
+Network=host
+# Host /proc: Polaris detects Game Mode and tracks Steam by scanning processes.
+PodmanArgs=--pid=host --ipc=host
+SecurityLabelDisable=true
+AddDevice=/dev/dri
+AddDevice=/dev/uinput
+# PipeWire (gamescope video node + audio), gamescope-0/-0-ei (libei input), session bus.
+Volume=%t:%t
+# No /tmp/.X11-unix mount: the private labwc's Xwayland must own that dir, and
+# Network=host already shares the host's abstract X sockets both ways.
+# Persistent named volume (polaris-config.volume); :U chowns it to the keep-id user.
+Volume=polaris-config.volume:%h/.config/polaris:U
+# Mesa shader cache and fontconfig cache.
+Volume=polaris-cache:%h/.cache:U
+# Private Stream writes its labwc config here.
+Volume=polaris-labwc:%h/.config/labwc-polaris:U
+Volume=%h/.steam:%h/.steam:ro
+Volume=%h/.local/share/Steam:%h/.local/share/Steam:ro
+Environment=HOME=%h
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+# Host compositor for Private Stream (GPU-native), which runs labwc windowed in it.
+EnvironmentFile=%t/polaris-display.env
+
+[Service]
+# Game Mode: gamescope-0 (not in the user manager env, so read gamescope's file).
+# Desktop Mode: Plasma exports WAYLAND_DISPLAY/DISPLAY to the user manager.
+# Test for a live gamescope: it leaves its socket and env file behind on exit.
+ExecStartPre=/bin/sh -c 'if pgrep -u %U -x "gamescope|gamescope-wl" >/dev/null; then echo WAYLAND_DISPLAY=gamescope-0; grep -E "^(DISPLAY|XDG_CURRENT_DESKTOP)=" %t/gamescope-environment; else env | grep -E "^(WAYLAND_DISPLAY|DISPLAY|XDG_CURRENT_DESKTOP)="; fi > %t/polaris-display.env; true'
+Restart=on-failure
+RestartSec=5s
+SuccessExitStatus=75
+RestartForceExitStatus=75
+TimeoutStartSec=900
+
+[Install]
+# Activated by both Game Mode (gamescope-session) and Desktop Mode (Plasma).
+WantedBy=graphical-session.target
+
+[Quadlet]
+# SteamOS never activates network-online.target; skip podman's 90s wait for it.
+DefaultDependencies=false
