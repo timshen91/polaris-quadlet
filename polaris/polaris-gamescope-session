@@ -1,0 +1,213 @@
+#!/bin/bash
+# Replaces Polaris's shipped polaris-gamescope-session (installed over
+# nix/modules/polaris-gamescope-session.sh at build time).
+#
+# With linux_stream_mode = gamescope_stream, Polaris wraps Steam Big Picture and
+# Steam titles as: prep `start [appid]`, app `wait`, prep undo `stop`. Instead of
+# Polaris's own nested session, this runs SteamOS's Game Mode session headless
+# at the client's mode: the host's /usr/lib/steamos/gamescope-session with only
+# its gamescope command replaced, steam-launcher (-steamos3 -steampal ...),
+# mangoapp, and ibus and steam_notif_daemon where no desktop provides them, as
+# transient user units. Polaris captures that gamescope's PipeWire node and
+# sends mouse and keyboard to its libei socket.
+#
+# Polaris may run in a container: `start` and `stop` copy this script to
+# $XDG_RUNTIME_DIR and run it on the host through the user manager.
+set -u
+
+rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+dst="$rt/polaris-steamos"
+envfile="$rt/gamescope-environment"
+stock_session=/usr/lib/steamos/gamescope-session
+# Stop order: clients first, gamescope last.
+units=(polaris-steamos-launch polaris-steamos-steam polaris-steamos-mangoapp polaris-steamos-notif polaris-steamos-ibus polaris-steamos-gamescope)
+
+# start-gamescope-session drops DISPLAY/XAUTHORITY from the user manager; a
+# desktop session may also have put its WAYLAND_DISPLAY there, which would send
+# Steam to that compositor.
+client_props=(
+  -p BindsTo=polaris-steamos-gamescope.service
+  -p After=polaris-steamos-gamescope.service
+  -p EnvironmentFile="$envfile"
+  -p "UnsetEnvironment=WAYLAND_DISPLAY XAUTHORITY"
+)
+
+stop_session() {
+  local u
+  # Let Steam exit on its own first: stopping steam-launcher's unit lets
+  # KillMode=mixed SIGKILL the client the moment its wrapper exits.
+  if systemctl --user -q is-active polaris-steamos-steam.service; then
+    systemd-run --user --quiet --collect --wait -p EnvironmentFile="$envfile" \
+      -p "UnsetEnvironment=WAYLAND_DISPLAY XAUTHORITY" -- steam -shutdown >/dev/null 2>&1
+    for _ in $(seq 30); do
+      systemctl --user -q is-active polaris-steamos-steam.service || break
+      sleep 1
+    done
+  fi
+  for u in "${units[@]}"; do
+    systemctl --user stop "$u.service" 2>/dev/null
+    systemctl --user reset-failed "$u.service" 2>/dev/null
+  done
+  return 0
+}
+
+# One Steam client per user: a desktop Steam would swallow our launch.
+stop_other_steam() {
+  pgrep -u "$(id -u)" -x steam >/dev/null || return 0
+  echo "polaris-gamescope-session: shutting down the running Steam client" >&2
+  steam -shutdown >/dev/null 2>&1 &
+  for _ in $(seq 60); do
+    pgrep -u "$(id -u)" -x steam >/dev/null || return 0
+    sleep 1
+  done
+  echo "polaris-gamescope-session: Steam did not exit" >&2
+  return 1
+}
+
+# Polaris captures from and makes these the default sink while streaming.
+ensure_sinks() {
+  local sinks name map desc
+  sinks="$(pactl list short sinks 2>/dev/null | awk '{print $2}')"
+  while read -r name map desc; do
+    grep -qx "$name" <<<"$sinks" && continue
+    pactl load-module module-null-sink media.class=Audio/Sink sink_name="$name" \
+      channel_map="$map" sink_properties="node.description=$desc" >/dev/null || true
+  done <<'EOF'
+sink-sunshine-stereo front-left,front-right Polaris-stereo
+sink-sunshine-surround51 front-left,front-right,rear-left,rear-right,front-center,lfe Polaris-5.1
+sink-sunshine-surround71 front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right Polaris-7.1
+EOF
+}
+
+# The host's gamescope-session up to its final `exec gamescope`, then ours:
+# headless at the client's mode instead of the panel (DRM, -O '*',eDP-1, fixed
+# 1280x800). --max-scale 1 because gamescope places libei absolute pointer
+# events (Moonlight touch) unscaled, so upscaled windows would eat taps.
+# Named polaris-*: Polaris treats any other running *gamescope-session* script
+# as Steam Game Mode.
+write_session() {
+  grep -q '^exec gamescope \\$' "$stock_session" || {
+    echo "polaris-gamescope-session: no 'exec gamescope' block in $stock_session" >&2
+    return 1
+  }
+  {
+    sed '/^exec gamescope \\$/,$d' "$stock_session"
+    cat <<'EOF'
+hdr_flags=()
+case "${POLARIS_CLIENT_HDR:-false}" in
+	true|TRUE|1|yes|YES) hdr_flags=(--hdr-enabled) ;;
+esac
+exec gamescope \
+	--backend headless \
+	-W "$POLARIS_SESSION_WIDTH" -H "$POLARIS_SESSION_HEIGHT" -r "$POLARIS_SESSION_FPS" \
+	-w "$POLARIS_SESSION_WIDTH" -h "$POLARIS_SESSION_HEIGHT" \
+	"${hdr_flags[@]}" \
+	--xwayland-count 2 \
+	--default-touch-mode 4 \
+	--hide-cursor-delay 3000 \
+	--max-scale 1 \
+	--fade-out-duration 200 \
+	-e -R "$socket" -T "$stats"
+EOF
+  } >"$dst/polaris-steamos-session"
+}
+
+# Hand a title to the running client once its UI is up.
+launch_app() {
+  local appid="$1"
+  for _ in $(seq 120); do
+    systemctl --user -q is-active polaris-steamos-steam.service || return 1
+    if pgrep -u "$(id -u)" -f steamwebhelper >/dev/null; then
+      sleep 5
+      echo "polaris-gamescope-session: launching appid $appid" >&2
+      systemd-run --user --quiet --collect -p EnvironmentFile="$envfile" \
+        -p "UnsetEnvironment=WAYLAND_DISPLAY XAUTHORITY" -- steam "steam://rungameid/$appid"
+      return
+    fi
+    sleep 1
+  done
+  echo "polaris-gamescope-session: Steam UI never came up; not launching $appid" >&2
+}
+
+host_start() {
+  local appid="${1:-}" w h fps
+  stop_session
+  stop_other_steam || return 1
+  ensure_sinks
+  write_session || return 1
+  w="${POLARIS_SESSION_TARGET_WIDTH:-1920}"
+  h="${POLARIS_SESSION_TARGET_HEIGHT:-1080}"
+  fps="${POLARIS_SESSION_TARGET_FPS:-60}"
+  echo "polaris-gamescope-session: starting ${w}x${h}@${fps} hdr=${POLARIS_CLIENT_HDR:-false} appid=${appid:-none}" >&2
+
+  # As gamescope-session.service, plus what start-gamescope-session sets.
+  # Returns once gamescope has answered on its startup socket (systemd-notify).
+  systemd-run --user --quiet --collect --unit=polaris-steamos-gamescope \
+    -p Type=notify -p NotifyAccess=all -p TimeoutStartSec=30 -p TimeoutStopSec=10 \
+    -p "UnsetEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY" \
+    -E XDG_SESSION_TYPE=x11 -E XDG_CURRENT_DESKTOP=gamescope -E SRT_LOG_TO_JOURNAL=1 \
+    -E POLARIS_SESSION_WIDTH="$w" -E POLARIS_SESSION_HEIGHT="$h" -E POLARIS_SESSION_FPS="$fps" \
+    -E POLARIS_CLIENT_HDR="${POLARIS_CLIENT_HDR:-false}" \
+    -- /bin/bash "$dst/polaris-steamos-session" || { stop_session; return 1; }
+
+  # As steam-launcher.service.
+  systemd-run --user --quiet --collect --unit=polaris-steamos-steam "${client_props[@]}" \
+    -p KillSignal=SIGCONT -p KillMode=mixed -p TimeoutStopSec=60 \
+    -p 'ExecStop=/bin/bash -c "kill -TERM $(pgrep -P $MAINPID || echo $MAINPID)"' \
+    -- /usr/lib/steamos/steam-launcher || { stop_session; return 1; }
+
+  # As gamescope-mangoapp.service.
+  systemd-run --user --quiet --collect --unit=polaris-steamos-mangoapp "${client_props[@]}" \
+    -p Restart=always -p TimeoutStopSec=5 -- /usr/bin/mangoapp
+  # As steam-notif-daemon.service, unless a desktop's notification server holds the name.
+  if ! busctl --user status org.freedesktop.Notifications >/dev/null 2>&1; then
+    systemd-run --user --quiet --collect --unit=polaris-steamos-notif "${client_props[@]}" \
+      -p TimeoutStopSec=5 -- /usr/bin/steam_notif_daemon
+  fi
+  # As ibus-gamescope.service, unless a desktop already runs ibus (-r would replace it).
+  if ! pgrep -u "$(id -u)" -x ibus-daemon >/dev/null; then
+    systemd-run --user --quiet --collect --unit=polaris-steamos-ibus "${client_props[@]}" \
+      -p TimeoutStopSec=5 -- /usr/bin/ibus-daemon -r --panel=disable --emoji-extension=disable
+  fi
+
+  # Its own unit: this script's unit ends, with everything in it, when start returns.
+  if [ -n "$appid" ]; then
+    systemd-run --user --quiet --collect --unit=polaris-steamos-launch \
+      -p BindsTo=polaris-steamos-steam.service -p After=polaris-steamos-steam.service \
+      -- /bin/bash "$dst/polaris-gamescope-session" host-launch "$appid"
+  fi
+}
+
+case "${1:-}" in
+  start|stop)
+    mkdir -p "$dst"
+    cp -f "$0" "$dst/polaris-gamescope-session"
+    # systemd-run drops the caller's env: forward the client's mode and HDR.
+    fwd=()
+    for v in POLARIS_SESSION_TARGET_WIDTH POLARIS_SESSION_TARGET_HEIGHT POLARIS_SESSION_TARGET_FPS POLARIS_CLIENT_HDR; do
+      [ -n "${!v+x}" ] && fwd+=(-E "$v")
+    done
+    exec systemd-run --user --quiet --collect --wait --pipe "${fwd[@]}" \
+      -- /bin/bash "$dst/polaris-gamescope-session" "host-$1" "${@:2}"
+    ;;
+  wait)
+    # The stream's app: Polaris ends it by killing this. The session itself
+    # lives until `stop`, so a disconnect and resume keeps the game running.
+    while systemctl --user -q is-active polaris-steamos-gamescope.service; do
+      sleep 1
+    done
+    ;;
+  host-start)
+    host_start "${2:-}"
+    ;;
+  host-stop)
+    stop_session
+    ;;
+  host-launch)
+    launch_app "$2"
+    ;;
+  *)
+    echo "usage: polaris-gamescope-session start [steam_appid]|wait|stop" >&2
+    exit 2
+    ;;
+esac

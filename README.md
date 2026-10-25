@@ -4,8 +4,11 @@
 podman Quadlet on SteamOS. Everything lives under `~`; the read-only root is never
 unlocked.
 
-Tested on SteamOS 3.9.3 with an AMD GPU (Strix Halo) and Polaris 1.4.13; an
-earlier revision was tested on Intel. NVIDIA is not covered.
+Polaris is built from upstream source with this repo's patches, and the image is
+published to `ghcr.io/timshen91/polaris-quadlet` by CI; the host only pulls it.
+
+Tested on SteamOS 3.9 with an AMD GPU (Strix Halo) and Polaris 1.4.13; an
+earlier revision was tested on Intel. NVIDIA is not covered (no CUDA build).
 
 ## Files
 
@@ -13,37 +16,80 @@ Install into `~/.config/containers/systemd/`:
 
 | File | Purpose |
 |---|---|
-| `polaris.build` | Builds `localhost/polaris:latest` from the Containerfile. |
-| `polaris/Containerfile` | Arch Linux + the official Polaris Arch package + Intel/AMD VAAPI and Vulkan userspace + gamescope (so Gamescope Stream is offered), plus the wrappers below. |
-| `polaris/steam-forward.sh` | Installed as the container's `/usr/bin/steam`; forwards to the host's Steam. |
-| `polaris/gamescope-session-forward.sh` | Installed as `/usr/bin/polaris-gamescope-session`; runs Polaris's shipped gamescope session script on the host. |
-| `polaris/gamescope-ready-diag.sh` | Debug aid appended to the host copy of the session lib; logs which ownership check failed on a readiness timeout. |
-| `polaris.container` | Runs Polaris: host network, host PID (Game Mode detection), `/dev/dri`, `/dev/uinput`, the user runtime dir (PipeWire, gamescope sockets, session bus). |
+| `polaris.container` | Runs the published image: host network, host PID (Game Mode detection), `/dev/dri`, `/dev/uinput`, the user runtime dir (PipeWire, gamescope sockets, session bus). |
 | `polaris-config.volume` | Named volume for Polaris settings, credentials and pairings. |
 
 Also used: named volumes `polaris-cache` (`~/.cache`) and `polaris-labwc`
 (`~/.config/labwc-polaris`), created automatically.
 
+The image (not installed on the host):
+
+| File | Purpose |
+|---|---|
+| `polaris/Containerfile` | Builds Polaris from a pinned upstream commit, as upstream CI builds its Arch package, then installs it on Arch Linux with Intel/AMD VAAPI and Vulkan userspace and gamescope (so Gamescope Stream is offered). |
+| `polaris/patches/` | Patches applied to upstream, one commit each (`git am`). |
+| `polaris/polaris-gamescope-session` | Installed as Polaris's Gamescope Stream helper; see below. |
+| `polaris/steam-forward.sh` | Installed as the container's `/usr/bin/steam`; forwards to the host's Steam. |
+
 ## Install
 
 ```sh
 mkdir -p ~/.config/containers/systemd
-cp -r polaris.build polaris.container polaris-config.volume polaris ~/.config/containers/systemd/
+cp polaris.container polaris-config.volume ~/.config/containers/systemd/
 systemctl --user daemon-reload
-systemctl --user start polaris-build polaris
+systemctl --user start polaris
 ```
 
 It starts via `xdg-desktop-autostart.target` (Desktop Mode) and
-`default.target` (at boot, for Game Mode; enable lingering with
-`loginctl enable-linger`). Web UI: `https://<host>:47990`.
+`default.target` (at boot; enable lingering with `loginctl enable-linger`).
+Web UI: `https://<host>:47990`.
+
+Host-specific settings go in a drop-in, e.g.
+`~/.config/containers/systemd/polaris.container.d/local.conf`.
 
 ## Upgrade
 
-Bump `POLARIS_VERSION` and `POLARIS_SHA256` in `polaris/Containerfile`, then:
+Pull the new image and restart:
 
 ```sh
-systemctl --user restart polaris-build polaris
+podman pull ghcr.io/timshen91/polaris-quadlet:latest
+systemctl --user restart polaris
 ```
+
+To move to a new Polaris version, bump `POLARIS_REF`/`POLARIS_COMMIT` in
+`polaris/Containerfile` and check the patches still apply. The *Upstream watch*
+workflow keeps an issue up to date with upstream Polaris releases and the state
+of the upstream fixes our patches wait for.
+
+## Patches
+
+| Patch | Why |
+|---|---|
+| `0001` Gamescope Stream without a portal | Gamescope Stream captures gamescope's own PipeWire node, but Polaris still required a desktop ScreenCast portal before probing encoders, so a host with no desktop session refused every launch. |
+
+## Gamescope Stream: SteamOS Game Mode, headless
+
+With `linux_stream_mode = gamescope_stream`, Polaris runs Steam Big Picture and
+Steam titles through `polaris-gamescope-session` (`start [appid]`, `wait`,
+`stop`). This repo's helper replaces Polaris's nested session with SteamOS's own
+Game Mode session, headless at the client's resolution and refresh rate:
+
+- The host's `/usr/lib/steamos/gamescope-session`, with only its final
+  `exec gamescope` replaced: `--backend headless` at the client's mode instead
+  of the panel, and `--max-scale 1`, because gamescope places libei absolute
+  pointer events (Moonlight touch) without the upscaling it applies to small
+  windows. Derived at run time, so SteamOS updates to the script carry over.
+- Stock `steam-launcher` (`-steamos3 -steampal -steamdeck -gamepadui`), so the
+  Steam button and overlay behave as in Game Mode, plus mangoapp, and ibus and
+  `steam_notif_daemon` unless a desktop already provides them.
+- Each runs as a transient user unit on the host (`polaris-steamos-*`), started
+  through the user manager because rootless podman cannot see host processes.
+- Polaris captures that gamescope's PipeWire node and sends mouse and keyboard
+  to its libei socket. A headless gamescope reads no input devices, so touch
+  has to be Moonlight's mouse emulation (`native_pen_touch = disabled`).
+- `stop` lets Steam exit (`steam -shutdown`) before stopping the units.
+- Official Game Mode must not be running: Polaris then streams that instead,
+  and Steam allows one client per user.
 
 ## How it fits together
 
@@ -60,24 +106,11 @@ systemctl --user restart polaris-build polaris
   `WAYLAND_DISPLAY`/`DISPLAY` the caller lacks (headless gamescope has no
   `WAYLAND_DISPLAY`). It lives in `/usr/bin` because Private Stream runs
   commands with `PATH=/usr/bin:/bin`.
-- **Gamescope Stream.** Rootless podman's user namespace cannot read
-  `/proc/<pid>/exe` or `environ` of host processes, so Polaris's gamescope
-  session script fails its ownership checks in the container.
-  `gamescope-session-forward.sh` copies the shipped script and lib into
-  `$XDG_RUNTIME_DIR/polaris-host-gamescope/` and runs them unchanged on the host
-  via `systemd-run --user --wait`, with `POLARIS_GAMESCOPE_COMPOSITE_CURSOR=0`
-  (SteamOS's gamescope lacks `--pipewire-composite-cursor`) and a 90s readiness
-  timeout (Steam can take 30-45s to start).
 - **X11.** `/tmp/.X11-unix` is deliberately not mounted: labwc's Xwayland must own
   it, and `Network=host` already shares the host's abstract X sockets.
 
-## Stream modes with VAAPI (Intel/AMD)
+## Capture with VAAPI (Intel/AMD)
 
-| Host state | What Polaris streams | Capture |
-|---|---|---|
-| Game Mode | The Game Mode screen (Polaris overrides any stream mode) | SHM with VAAPI; GPU (DMA-BUF) with PyroWave |
-| Desktop Mode, Private Stream | A private headless labwc | SHM: Polaris hard-disables VAAPI DMA-BUF for this route (issues #409/#410) |
-| Desktop Mode, Mirror Desktop | KDE via the portal | Needs approval on the host |
-
-`POLARIS_PORTAL_DMABUF=1` would enable VAAPI DMA-BUF for the Game Mode / portal
-route only; it is not set here and untested on this hardware.
+Polaris captures with GPU buffers (DMA-BUF) by default only for PyroWave and
+CUDA; VAAPI uses a CPU copy unless `POLARIS_PORTAL_DMABUF=1` is set, which
+Polaris treats as an unvalidated opt-in.

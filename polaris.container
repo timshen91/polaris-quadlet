@@ -8,7 +8,8 @@ StartLimitIntervalSec=500
 StartLimitBurst=5
 
 [Container]
-Image=polaris.build
+# Built from source and published by .github/workflows/image.yml.
+Image=ghcr.io/timshen91/polaris-quadlet:latest
 ContainerName=polaris
 # Same uid as the host user: keeps the user's ACLs on /dev/uinput and /dev/dri/card*
 # and lets Polaris use the session's sockets.

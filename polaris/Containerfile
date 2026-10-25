@@ -1,34 +1,72 @@
 # Polaris game stream host, packaged for rootless podman on SteamOS.
-# Built by ../polaris.build; run by ../polaris.container.
-# To upgrade: bump POLARIS_VERSION/POLARIS_SHA256 (the release asset's digest),
-# then `systemctl --user restart polaris-build polaris`.
-FROM docker.io/library/archlinux:latest
+# Built from source by .github/workflows/image.yml and published to
+# ghcr.io/timshen91/polaris-quadlet; run by ../polaris.container.
+#
+# Polaris is built from upstream source with patches/*.patch applied and
+# polaris-gamescope-session installed as its Gamescope Stream helper, the
+# same way upstream's CI builds its Arch package (CMake generates the
+# PKGBUILD, then makepkg). To upgrade: bump POLARIS_REF/POLARIS_COMMIT and
+# check that the patches still apply.
+ARG ARCH_IMAGE=docker.io/library/archlinux:latest
 
-ARG POLARIS_VERSION=1.4.13
-ARG POLARIS_SHA256=cabab97cc37accb70553f7d27b038f122dd5e513d7632a2be5ec137e549b4b72
+FROM ${ARCH_IMAGE} AS build
+
+ARG POLARIS_REF=v1.4.13
+ARG POLARIS_COMMIT=e7bbad307d8dde2bcf0105aea6424252a61d01c2
+
+# Upstream PKGBUILD's depends and makedepends (makepkg runs with --nodeps).
+RUN pacman -Syu --noconfirm --needed \
+      base-devel git appstream appstream-glib cmake desktop-file-utils gcc go make \
+      ninja nlohmann-json nodejs npm shaderc vulkan-headers \
+      avahi boost boost-libs curl grim labwc libayatana-appindicator libcap libdrm \
+      libei libevdev libmfx libnotify libpulse libva libx11 libxcb libxfixes libxi \
+      libxrandr libxtst mesa miniupnpc numactl openssl opus pipewire python udev \
+      vulkan-icd-loader wayland wayland-protocols which wlr-randr xorg-xdpyinfo \
+      xorg-xwayland \
+ && useradd -m builder
+
+USER builder
+WORKDIR /home/builder
+COPY --chown=builder patches/ overlay/patches/
+COPY --chown=builder polaris-gamescope-session overlay/
+
+RUN git config --global user.name polaris-quadlet \
+ && git config --global user.email polaris-quadlet@localhost \
+ && git config --global protocol.file.allow always \
+ && git clone --branch "$POLARIS_REF" https://github.com/papi-ux/polaris.git src \
+ && test "$(git -C src rev-parse HEAD)" = "$POLARIS_COMMIT" \
+ && git -C src am --3way /home/builder/overlay/patches/*.patch \
+ && cp overlay/polaris-gamescope-session src/nix/modules/polaris-gamescope-session.sh \
+ && git -C src commit -qam "Install polaris-quadlet's Gamescope Stream helper"
+
+# As upstream CI: generate the PKGBUILD from this tree (cloned by commit, so
+# the patches above are what gets built), with the browser stream enabled.
+RUN cd src \
+ && env BRANCH="$POLARIS_REF" \
+        BUILD_VERSION="$(grep -Pom1 '^project\(Polaris VERSION \K[^ ]+' CMakeLists.txt)" \
+        CLONE_URL="file:///home/builder/src" \
+        COMMIT="$(git rev-parse HEAD)" \
+      cmake -S . -B ../arch-pkgbuild -DPOLARIS_CONFIGURE_PKGBUILD=ON -DPOLARIS_CONFIGURE_ONLY=ON \
+ && cd ../arch-pkgbuild \
+ && sed -i "s|^  'git'\$|  'git'\n  'go'|; s|^      -D POLARIS_ASSETS_DIR=\"share/polaris\"\$|&\n      -D POLARIS_ENABLE_BROWSER_STREAM=ON|" PKGBUILD \
+ && MAKEFLAGS="-j$(nproc)" makepkg --nodeps --noconfirm --nocheck
+
+FROM ${ARCH_IMAGE}
 
 # gamescope: only so Polaris offers Gamescope Stream (linux_stream_mode =
-# gamescope_stream); the session itself runs on the host (see below).
-# Intel and AMD VAAPI/QSV/Vulkan userspace for the encoder. (NVIDIA would need
-# nvidia-utils matching the host's driver version; not covered here.)
+# gamescope_stream); the session itself runs on the host. Intel and AMD
+# VAAPI/QSV/Vulkan userspace for the encoder. (NVIDIA would need nvidia-utils
+# matching the host's driver version, and a CUDA build; not covered here.)
+COPY --from=build /home/builder/arch-pkgbuild/ /tmp/pkg/
 RUN pacman -Syu --noconfirm \
       mesa intel-media-driver vpl-gpu-rt vulkan-intel vulkan-radeon \
       gamescope \
- && curl -fsSL -o /tmp/polaris.pkg.tar.zst \
-      "https://github.com/papi-ux/polaris/releases/download/v${POLARIS_VERSION}/Polaris-arch-x86_64.pkg.tar.zst" \
- && echo "${POLARIS_SHA256}  /tmp/polaris.pkg.tar.zst" | sha256sum -c - \
- && pacman -U --noconfirm /tmp/polaris.pkg.tar.zst \
- && rm -f /tmp/polaris.pkg.tar.zst \
+ && pacman -U --noconfirm $(ls /tmp/pkg/polaris-[0-9]*.pkg.tar.zst) \
+ && rm -rf /tmp/pkg \
  && pacman -Scc --noconfirm
 
 # Forward `steam ...` to the host's Steam client; see steam-forward.sh.
 COPY steam-forward.sh /usr/bin/steam
 RUN chmod 0755 /usr/bin/steam
-
-# Run the gamescope session script on the host; see gamescope-session-forward.sh.
-# The shipped copies stay in /usr/share/polaris/gamescope.
-COPY gamescope-session-forward.sh /usr/bin/polaris-gamescope-session
-COPY gamescope-ready-diag.sh /usr/share/polaris-host/gamescope-ready-diag.sh
-RUN chmod 0755 /usr/bin/polaris-gamescope-session
 
 ENTRYPOINT ["/usr/bin/polaris"]

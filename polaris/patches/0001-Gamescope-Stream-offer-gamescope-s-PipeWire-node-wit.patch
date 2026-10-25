@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Shen <timshen91@gmail.com>
+Date: Sun, 25 Oct 2026 22:07:46 +0900
+Subject: [PATCH] Gamescope Stream: offer gamescope's PipeWire node without a
+ ScreenCast portal
+
+Gamescope Stream captures gamescope's own PipeWire node (gamescopegrab) and
+never opens a ScreenCast session for it, but portal_display_names() still
+required a desktop portal outside Game Mode. On a host with no desktop
+session every encoder probe and launch was refused. Probes run in probe mode
+and capture nothing, so the node need not exist until the session helper's
+prep command has started gamescope.
+---
+ src/platform/linux/portal_grab.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/platform/linux/portal_grab.cpp b/src/platform/linux/portal_grab.cpp
+index fcd9801..e64c82a 100644
+--- a/src/platform/linux/portal_grab.cpp
++++ b/src/platform/linux/portal_grab.cpp
+@@ -1440,6 +1440,16 @@ namespace platf {
+       return names;
+     }
+ 
++    // Gamescope Stream attaches to the same node (gamescopegrab) and never opens a ScreenCast
++    // session for it, so a host with no desktop session, and so no portal, can still stream it.
++    // The node need not exist yet: the session helper's prep command creates the gamescope, and
++    // encoder probes before that run in probe mode, which captures nothing.
++    if (config::video.linux_display.stream_mode == "gamescope_stream") {
++      BOOST_LOG(info) << "Portal: Gamescope Stream captures gamescope's own PipeWire node"sv;
++      names.emplace_back("0");
++      return names;
++    }
++
+     if (!portal::is_portal_available()) {
+       BOOST_LOG(debug) << "Portal: ScreenCast interface not available"sv;
+       return names;

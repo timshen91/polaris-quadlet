@@ -1,0 +1,69 @@
+name: Upstream watch
+
+# Weekly report on what our patches and pins depend on, kept in one issue that
+# is updated (with a comment) only when the report changes:
+# - Polaris releases against the pinned POLARIS_REF,
+# - whether Polaris master still blocks AV1 on its Vulkan encoder (NO_AV1),
+#   and which prepared FFmpeg (LizardByte/build-deps) it pins,
+# - recent FFmpeg commits to the Vulkan AV1 encoder.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TITLE: Upstream watch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build report
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/^ARG POLARIS_REF=//p' polaris/Containerfile)"
+          video="$(gh api repos/papi-ux/polaris/contents/src/video.cpp --jq .content | base64 -d)"
+          ffmpeg_pin="$(gh api repos/papi-ux/polaris/contents/cmake/dependencies/prepared_ffmpeg.cmake --jq .content \
+            | base64 -d | sed -n 's/.*POLARIS_PREPARED_FFMPEG_RELEASE_TAG "\([^"]*\)".*/\1/p' | head -1)"
+          if grep -q 'PARALLEL_ENCODING | NO_AV1' <<<"$video"; then
+            av1="still blocked (NO_AV1 on the Vulkan encoder)"
+          else
+            av1="**no longer blocked: check upstream's FFmpeg and drop our AV1 work**"
+          fi
+          {
+            echo "## Polaris"
+            echo "- Pinned: \`$pinned\`"
+            echo "- Releases:"
+            gh release list -R papi-ux/polaris --limit 5 --json tagName,isPrerelease,publishedAt \
+              --jq '.[] | "  - `\(.tagName)`\(if .isPrerelease then " (pre-release)" else "" end), \(.publishedAt[0:10])"'
+            echo "- Vulkan AV1 on master: $av1"
+            echo "- Prepared FFmpeg on master: \`${ffmpeg_pin:-unknown}\`"
+            echo
+            echo "## LizardByte/build-deps"
+            gh release list -R LizardByte/build-deps --limit 3 --json tagName,publishedAt \
+              --jq '.[] | "- `\(.tagName)`, \(.publishedAt[0:10])"'
+            echo
+            echo "## FFmpeg libavcodec/vulkan_encode_av1.c"
+            gh api "repos/FFmpeg/FFmpeg/commits?path=libavcodec/vulkan_encode_av1.c&per_page=8" \
+              --jq '.[] | "- \(.commit.committer.date[0:10]) [`\(.sha[0:10])`](\(.html_url)) \(.commit.message | split("\n")[0])"'
+          } > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update issue
+        run: |
+          set -euo pipefail
+          number="$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+            --jq "map(select(.title == \"$TITLE\"))[0].number // empty")"
+          if [ -z "$number" ]; then
+            gh issue create --title "$TITLE" --body-file report.md
+          elif [ "$(gh issue view "$number" --json body --jq .body)" != "$(cat report.md)" ]; then
+            gh issue edit "$number" --body-file report.md
+            gh issue comment "$number" --body "Upstream changed; the report above is updated."
+          fi
