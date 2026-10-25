@@ -1,0 +1,6 @@
+[Unit]
+Description=Fake display at %i for Polaris
+
+[Service]
+Type=oneshot
+ExecStart=/etc/polaris-fake-display/polaris-fake-display plug %i

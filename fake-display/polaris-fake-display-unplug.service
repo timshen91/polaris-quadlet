@@ -1,0 +1,6 @@
+[Unit]
+Description=Remove Polaris's fake display
+
+[Service]
+Type=oneshot
+ExecStart=/etc/polaris-fake-display/polaris-fake-display unplug

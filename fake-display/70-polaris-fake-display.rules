@@ -1,0 +1,4 @@
+# polaris-fake-display sends the hotplug uevent the kernel would, but a
+# synthetic uevent carries HOTPLUG=1 as SYNTH_ARG_HOTPLUG=1: give compositors
+# (wlroots, gamescope) the property they look for.
+ACTION=="change", SUBSYSTEM=="drm", ENV{SYNTH_ARG_HOTPLUG}=="1", ENV{HOTPLUG}="1"

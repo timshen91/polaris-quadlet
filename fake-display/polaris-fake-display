@@ -1,0 +1,191 @@
+#!/usr/bin/python3 -I
+"""Plug a fake display into an unused GPU connector, through generic DRM.
+
+    polaris-fake-display plug WIDTHxHEIGHT@HZ   create it, or change its mode
+                                                (or WIDTHxHEIGHT-HZ, for a unit instance)
+    polaris-fake-display unplug                 remove it
+    polaris-fake-display edid WIDTHxHEIGHT@HZ   write the EDID to stdout
+
+Writes a generated EDID to the connector's debugfs edid_override and forces
+it connected through sysfs status; both are DRM core, so this needs root but
+no particular driver. The EDID offers the requested mode as preferred, a
+48 Hz..requested VRR range (EDID range limits, plus AMD's FreeSync block for
+HDMI) and no audio, so nothing routes sound to it.
+
+Stock SteamOS Game Mode prefers an external display (-O '*',eDP-1), so it
+moves to the fake one and the internal panel goes dark; unplugging hands the
+panel back. Both send a hotplug uevent. The connector and mode in use are kept
+in /run/polaris-fake-display.
+"""
+import hashlib
+import math
+import os
+import re
+import sys
+
+STATE = "/run/polaris-fake-display"
+DRM = "/sys/class/drm"
+
+
+def cvt_rb2(width, height, refresh):
+    """CVT reduced blanking v2 timing: (pixel clock in 10 kHz, h, v) tuples."""
+    h_blank, h_front, h_sync = 80, 8, 32
+    v_sync, v_back, min_vblank_us, min_v_front = 8, 6, 460, 1
+    h_total = width + h_blank
+    line_us = (1e6 / refresh - min_vblank_us) / height
+    v_blank = max(math.ceil(min_vblank_us / line_us), v_sync + v_back + min_v_front)
+    v_total = height + v_blank
+    clock = round(h_total * v_total * refresh / 1e4)
+    return clock, (width, h_blank, h_front, h_sync), (height, v_blank, v_blank - v_sync - v_back, v_sync)
+
+
+def dtd(width, height, refresh):
+    clock, (ha, hb, hf, hs), (va, vb, vf, vs) = cvt_rb2(width, height, refresh)
+    w_mm, h_mm = 600, round(600 * height / width)
+    return bytes([
+        clock & 0xFF, clock >> 8,
+        ha & 0xFF, hb & 0xFF, (ha >> 8) << 4 | hb >> 8,
+        va & 0xFF, vb & 0xFF, (va >> 8) << 4 | vb >> 8,
+        hf & 0xFF, hs & 0xFF, (vf & 0xF) << 4 | vs & 0xF,
+        (hf >> 8) << 6 | (hs >> 8) << 4 | (vf >> 4) << 2 | vs >> 4,
+        w_mm & 0xFF, h_mm & 0xFF, (w_mm >> 8) << 4 | h_mm >> 8,
+        0, 0,
+        0x1A,  # digital separate sync, +hsync -vsync (CVT-RB)
+    ])
+
+
+def text_descriptor(tag, text):
+    body = (text.encode() + b"\n").ljust(13, b" ")[:13]
+    return bytes([0, 0, 0, tag, 0]) + body
+
+
+def checksum(block):
+    return block + bytes([(-sum(block)) % 256])
+
+
+def edid(width, height, refresh):
+    min_hz, max_hz = 48, refresh
+    clock = cvt_rb2(width, height, refresh)[0]
+    h_khz = math.ceil(clock * 10 / (width + 80))
+    serial = int.from_bytes(hashlib.sha1(f"{width}x{height}@{refresh}".encode()).digest()[:4], "little")
+    base = bytes([0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0])
+    base += bytes([0x41, 0x92])                 # manufacturer "PLR"
+    base += (1).to_bytes(2, "little")           # product
+    base += serial.to_bytes(4, "little")        # a mode of its own looks like a new monitor
+    base += bytes([0, 36, 1, 4])                # 2026, EDID 1.4
+    base += bytes([0xA2, 60, round(60 * height / width), 0x78])  # digital 8 bpc HDMI-a, size cm, gamma 2.2
+    base += bytes([0x07])                       # sRGB, preferred timing, continuous frequency (VRR)
+    base += bytes([0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54])  # sRGB chromaticity
+    base += bytes([0x20, 0, 0])                 # 640x480@60, which HDMI requires
+    base += bytes([1, 1] * 8)                   # no standard timings
+    base += dtd(width, height, refresh)
+    base += bytes([0, 0, 0, 0xFD, 0, min_hz, max_hz, 30, h_khz,
+                   math.ceil(clock / 1000) + 1, 0x01, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20])
+    base += text_descriptor(0xFC, "Polaris VD")
+    base += bytes([0, 0, 0, 0x10] + [0] * 14)    # unused
+    base += bytes([1])                          # one extension
+    blocks = [
+        bytes([0xE2, 0x00, 0x4A]),                                          # VCDB: selectable RGB range, underscanned
+        bytes([0x67, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x00, 0x44]),            # HDMI 1.4, 340 MHz TMDS
+        bytes([0x68, 0x1A, 0x00, 0x00, 0x01, 0x01, min_hz, max_hz, 0x00]),  # AMD FreeSync range
+    ]
+    data = b"".join(blocks)
+    cta = bytes([0x02, 0x03, 4 + len(data), 0x80]) + data  # underscans IT formats
+    cta = cta.ljust(127, b"\0")
+    return checksum(base) + checksum(cta)
+
+
+def parse_mode(text):
+    m = re.fullmatch(r"(\d+)x(\d+)[@-](\d+)(?:\.\d*)?", text)
+    if not m:
+        sys.exit(f"bad mode {text!r}: expected WIDTHxHEIGHT@HZ")
+    width, height, refresh = map(int, m.groups())
+    if cvt_rb2(width, height, refresh)[0] > 34000:
+        sys.exit(f"{text} needs more than 340 MHz, which HDMI cannot carry without a scrambling handshake")
+    return width, height, refresh
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write(path, data):
+    with open(path, "wb" if isinstance(data, bytes) else "w") as f:
+        f.write(data)
+
+
+def debugfs_dir(card_connector):
+    card, connector = card_connector.split("-", 1)
+    return f"/sys/kernel/debug/dri/{card.removeprefix('card')}/{connector}"
+
+
+def pick_connector():
+    if os.path.exists(f"{STATE}/connector"):
+        return read(f"{STATE}/connector")
+    wanted = os.environ.get("POLARIS_FAKE_DISPLAY_CONNECTOR")
+    names = sorted(n for n in os.listdir(DRM) if re.fullmatch(r"card\d+-(HDMI-A|DP)-\d+", n))
+    # HDMI first: DisplayPort needs a link handshake no fake display can answer.
+    names.sort(key=lambda n: "-HDMI-" not in n)
+    for name in names:
+        if (wanted is None or name.endswith(f"-{wanted}")) and read(f"{DRM}/{name}/status") == "disconnected":
+            return name
+    sys.exit("no free HDMI or DisplayPort connector")
+
+
+def hotplug(card_connector):
+    # Forcing a connector through sysfs re-reads its modes but tells no one.
+    # Send the hotplug uevent the kernel would; 70-polaris-fake-display.rules
+    # turns its SYNTH_ARG_HOTPLUG=1 into the HOTPLUG=1 compositors look for.
+    card = card_connector.split("-", 1)[0]
+    with open("/proc/sys/kernel/random/uuid") as f:
+        uuid = f.read().strip()
+    write(f"{DRM}/{card}/uevent", f"change {uuid} HOTPLUG=1")
+
+
+def plug(mode):
+    width, height, refresh = parse_mode(mode)
+    name = f"{width}x{height}@{refresh}"
+    if os.path.exists(f"{STATE}/mode") and read(f"{STATE}/mode") == name:
+        print(f"{read(f'{STATE}/connector')}: {name} already")
+        return
+    connector = pick_connector()
+    write(f"{debugfs_dir(connector)}/edid_override", edid(width, height, refresh))
+    # sysfs only re-reads the modes when the forced status changes, so
+    # alternate between the two forced-on values.
+    status = "on-digital" if os.path.exists(f"{STATE}/status") and read(f"{STATE}/status") == "on" else "on"
+    write(f"{DRM}/{connector}/status", status)
+    os.makedirs(STATE, exist_ok=True)
+    write(f"{STATE}/connector", connector)
+    write(f"{STATE}/status", status)
+    write(f"{STATE}/mode", name)
+    hotplug(connector)
+    print(f"{connector}: {name}")
+
+
+def unplug():
+    if not os.path.exists(f"{STATE}/connector"):
+        return
+    connector = read(f"{STATE}/connector")
+    write(f"{DRM}/{connector}/status", "detect")
+    write(f"{debugfs_dir(connector)}/edid_override", "reset")
+    hotplug(connector)
+    for name in ("connector", "status", "mode"):
+        if os.path.exists(f"{STATE}/{name}"):
+            os.unlink(f"{STATE}/{name}")
+    print(f"{connector}: unplugged")
+
+
+def main(argv):
+    if len(argv) == 2 and argv[0] == "edid":
+        sys.stdout.buffer.write(edid(*parse_mode(argv[1])))
+    elif len(argv) == 2 and argv[0] == "plug":
+        plug(argv[1])
+    elif argv == ["unplug"]:
+        unplug()
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,10 @@
+// Polaris runs as @USER@ and plugs or unplugs the fake display through these
+// two units only: polaris-fake-display@WIDTHxHEIGHT-HZ and -unplug.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      action.lookup("verb") == "start" &&
+      /^polaris-fake-display(@[0-9]+x[0-9]+-[0-9]+|-unplug)\.service$/.test(action.lookup("unit")) &&
+      subject.user == "@USER@") {
+    return polkit.Result.YES;
+  }
+});

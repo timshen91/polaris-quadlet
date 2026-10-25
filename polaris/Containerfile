@@ -67,6 +67,8 @@ RUN pacman -Syu --noconfirm \
 
 # Forward `steam ...` to the host's Steam client; see steam-forward.sh.
 COPY steam-forward.sh /usr/bin/steam
-RUN chmod 0755 /usr/bin/steam
+# Prep/state command plugging the host's fake display; see ../fake-display.
+COPY polaris-fake-display /usr/bin/polaris-fake-display
+RUN chmod 0755 /usr/bin/steam /usr/bin/polaris-fake-display
 
 ENTRYPOINT ["/usr/bin/polaris"]

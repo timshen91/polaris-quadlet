@@ -66,6 +66,44 @@ of the upstream fixes our patches wait for.
 | Patch | Why |
 |---|---|
 | `0001` Gamescope Stream without a portal | Gamescope Stream captures gamescope's own PipeWire node, but Polaris still required a desktop ScreenCast portal before probing encoders, so a host with no desktop session refused every launch. |
+| `0002` Resume sees the resuming client | State commands (run on resume) got the launching client's `POLARIS_CLIENT_*` mode, so a client reconnecting at another resolution could not resize anything for itself. |
+
+## Fake display: stock Game Mode at the client's resolution
+
+Streams stock SteamOS Game Mode, but on a fake monitor sized for the client
+instead of the internal panel, captured from gamescope's PipeWire stream as
+usual (native touch included, since Game Mode reads input devices):
+
+- Launch plugs a fake display into an unused HDMI (or DisplayPort) connector at
+  the client's mode. Game Mode prefers external displays, so it moves there and
+  the panel goes dark.
+- A client resuming the session at another mode replugs it at that mode; Steam
+  and the running game stay up.
+- Ending the session unplugs it, and Game Mode returns to the panel.
+
+`fake-display/polaris-fake-display` does this through generic DRM: an EDID
+(the mode as preferred, a 48 Hz..mode VRR range, no audio) written to debugfs
+`edid_override`, the connector forced on through sysfs `status`, and a hotplug
+uevent. That needs root but no kernel module and no particular driver; the
+driver only has to light a connector with nothing attached (tested on amdgpu).
+Polaris reaches it through two root-owned units polkit lets its user start.
+
+Install on the host (writes under `/etc` only):
+
+```sh
+sudo fake-display/install.sh "$USER"
+```
+
+then add to Polaris's config (`polaris.conf`, or the web UI's command settings),
+with `native_pen_touch = enabled` for native touch:
+
+```
+global_prep_cmd = [{"do":"polaris-fake-display plug","undo":"polaris-fake-display unplug"}]
+global_state_cmd = [{"do":"polaris-fake-display plug","undo":""}]
+```
+
+Modes are limited to 340 MHz pixel clock (e.g. 1920x1080@120, 2560x1440@60):
+higher needs HDMI 2.0 scrambling, which a monitor-less link cannot negotiate.
 
 ## Gamescope Stream: SteamOS Game Mode, headless
 
