@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove Polaris's fake display once no stream has used it for a while
+# Each session end restarts this countdown and each plug stops it, so the
+# display (and the internal panel) only switches when streaming has stopped.
+# Switching back to the panel between sessions is when amdgpu's display
+# firmware (Panel Replay) and page flips have misbehaved.
+
+[Timer]
+OnActiveSec=15min
+Unit=polaris-fake-display-unplug.service

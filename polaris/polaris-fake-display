@@ -1,19 +1,26 @@
 #!/bin/sh
 # Polaris prep/state command for the host's fake display (see fake-display/ in
-# polaris-quadlet): `plug` sizes it for the client in POLARIS_CLIENT_WIDTH,
-# _HEIGHT and _FPS, creating it if needed; `unplug` removes it. The host runs
-# them as root-owned units that polkit lets this user start.
+# polaris-quadlet):
+#   plug       size it for the client in POLARIS_CLIENT_WIDTH, _HEIGHT and
+#              _FPS, creating it if needed (and cancelling a pending unplug)
+#   unplug     remove it once no stream has used it for a while (the host's
+#              polaris-fake-display-idle.timer), not right away
+#   unplug-now remove it now
+# The host runs them as root-owned units that polkit lets this user start.
 case "${1:-}" in
   plug)
-    unit="polaris-fake-display@${POLARIS_CLIENT_WIDTH:?}x${POLARIS_CLIENT_HEIGHT:?}-${POLARIS_CLIENT_FPS%%.*}.service"
+    set -- start "polaris-fake-display@${POLARIS_CLIENT_WIDTH:?}x${POLARIS_CLIENT_HEIGHT:?}-${POLARIS_CLIENT_FPS%%.*}.service"
     ;;
   unplug)
-    unit=polaris-fake-display-unplug.service
+    set -- restart polaris-fake-display-idle.timer
+    ;;
+  unplug-now)
+    set -- start polaris-fake-display-unplug.service
     ;;
   *)
-    echo "usage: polaris-fake-display plug|unplug" >&2
+    echo "usage: polaris-fake-display plug|unplug|unplug-now" >&2
     exit 2
     ;;
 esac
 # Through the user manager: the container has no system bus.
-exec systemd-run --user --quiet --collect --wait --pipe -- systemctl start "$unit"
+exec systemd-run --user --quiet --collect --wait --pipe -- systemctl "$@"

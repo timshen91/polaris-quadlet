@@ -74,12 +74,26 @@ Streams stock SteamOS Game Mode, but on a fake monitor sized for the client
 instead of the internal panel, captured from gamescope's PipeWire stream as
 usual (native touch included, since Game Mode reads input devices):
 
-- Launch plugs a fake display into an unused HDMI (or DisplayPort) connector at
-  the client's mode. Game Mode prefers external displays, so it moves there and
-  the panel goes dark.
-- A client resuming the session at another mode replugs it at that mode; Steam
-  and the running game stay up.
-- Ending the session unplugs it, and Game Mode returns to the panel.
+- Launch plugs a fake display into an unused HDMI connector at the client's
+  mode. Game Mode prefers external displays, so it moves there and the panel
+  goes dark.
+- A client resuming or relaunching at another mode only changes the fake
+  display's mode, before the session's capture starts; Steam and the running
+  game stay up.
+- Ending the session starts a 15 minute countdown
+  (`polaris-fake-display-idle.timer`); the next stream cancels it. Only when
+  it runs out does the fake display go away and Game Mode return to the panel.
+- A mode the fake display cannot carry (over 340 MHz: above that HDMI needs a
+  scrambling handshake no fake display can answer) falls back to the same size
+  at a lower refresh rate (down to 60 Hz), then the same aspect ratio, smaller;
+  Polaris scales to the client.
+
+On amdgpu, driving a connector with nothing attached works, but switching
+between it and the internal panel is where the display firmware (Panel
+Replay) and page flips misbehaved, and a compositor torn down mid-flip on it
+could leave a CRTC unable to flip until a reboot. Hence the countdown, and a
+drop-in that unplugs before Game Mode's gamescope stops. DisplayPort
+connectors are never used.
 
 `fake-display/polaris-fake-display` does this through generic DRM: an EDID
 (the mode as preferred, a 48 Hz..mode VRR range, no audio) written to debugfs
@@ -102,8 +116,7 @@ global_prep_cmd = [{"do":"polaris-fake-display plug","undo":"polaris-fake-displa
 global_state_cmd = [{"do":"polaris-fake-display plug","undo":""}]
 ```
 
-Modes are limited to 340 MHz pixel clock (e.g. 1920x1080@120, 2560x1440@60):
-higher needs HDMI 2.0 scrambling, which a monitor-less link cannot negotiate.
+To get the panel back right away: `systemctl start polaris-fake-display-unplug.service`.
 
 ## Gamescope Stream: SteamOS Game Mode, headless
 

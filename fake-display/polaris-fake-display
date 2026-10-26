@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Plug a fake display into an unused GPU connector, through generic DRM.
+"""Plug a fake display into an unused HDMI connector, through generic DRM.
 
     polaris-fake-display plug WIDTHxHEIGHT@HZ   create it, or change its mode
                                                 (or WIDTHxHEIGHT-HZ, for a unit instance)
@@ -100,10 +100,32 @@ def parse_mode(text):
     m = re.fullmatch(r"(\d+)x(\d+)[@-](\d+)(?:\.\d*)?", text)
     if not m:
         sys.exit(f"bad mode {text!r}: expected WIDTHxHEIGHT@HZ")
-    width, height, refresh = map(int, m.groups())
-    if cvt_rb2(width, height, refresh)[0] > 34000:
-        sys.exit(f"{text} needs more than 340 MHz, which HDMI cannot carry without a scrambling handshake")
-    return width, height, refresh
+    return tuple(map(int, m.groups()))
+
+
+def fits(width, height, refresh):
+    """Within 340 MHz (above it HDMI needs a scrambling handshake a fake
+    display cannot answer) and with a vertical front porch an EDID timing can
+    encode (6 bits)."""
+    clock, _, (_, _, v_front, _) = cvt_rb2(width, height, refresh)
+    return clock <= 34000 and v_front <= 63
+
+
+def fit_mode(width, height, refresh):
+    """The requested mode, or the closest one that fits: the same size at a
+    lower refresh rate down to 60 Hz, then the same aspect ratio, smaller.
+    Polaris scales the capture to the client either way."""
+    rates = [refresh] + [r for r in (120, 100, 90, 75, 60) if r < refresh]
+    for rate in rates:
+        if fits(width, height, rate):
+            return width, height, rate
+    rate = rates[-1]
+    for percent in range(95, 20, -5):
+        w = width * percent // 100 // 8 * 8
+        h = round(w * height / width / 2) * 2
+        if fits(w, h, rate):
+            return w, h, rate
+    sys.exit(f"no mode like {width}x{height}@{refresh} fits")
 
 
 def read(path):
@@ -125,13 +147,22 @@ def pick_connector():
     if os.path.exists(f"{STATE}/connector"):
         return read(f"{STATE}/connector")
     wanted = os.environ.get("POLARIS_FAKE_DISPLAY_CONNECTOR")
-    names = sorted(n for n in os.listdir(DRM) if re.fullmatch(r"card\d+-(HDMI-A|DP)-\d+", n))
-    # HDMI first: DisplayPort needs a link handshake no fake display can answer.
-    names.sort(key=lambda n: "-HDMI-" not in n)
+    # HDMI only: a DisplayPort link expects a handshake no fake display can
+    # answer, and on amdgpu forcing one on left the timing generator unable to
+    # blank until a reboot.
+    names = sorted(n for n in os.listdir(DRM) if re.fullmatch(r"card\d+-HDMI-A-\d+", n))
     for name in names:
-        if (wanted is None or name.endswith(f"-{wanted}")) and read(f"{DRM}/{name}/status") == "disconnected":
+        if wanted is not None and not name.endswith(f"-{wanted}"):
+            continue
+        if read(f"{DRM}/{name}/status") == "connected" and \
+                read(f"{debugfs_dir(name)}/force") == "unspecified" and \
+                not open(f"{debugfs_dir(name)}/edid_override", "rb").read():
+            # A fake display unplugged while a compositor still drove it can
+            # stay "connected" until something probes it again.
+            write(f"{DRM}/{name}/status", "detect")
+        if read(f"{DRM}/{name}/status") == "disconnected":
             return name
-    sys.exit("no free HDMI or DisplayPort connector")
+    sys.exit("no free HDMI connector")
 
 
 def hotplug(card_connector):
@@ -168,8 +199,11 @@ def wait_for_scanout(card_connector, width, height, refresh, timeout=5.0):
 
 
 def plug(mode):
-    width, height, refresh = parse_mode(mode)
+    requested = parse_mode(mode)
+    width, height, refresh = fit_mode(*requested)
     name = f"{width}x{height}@{refresh}"
+    if (width, height, refresh) != requested:
+        print("{}x{}@{} does not fit; using {}".format(*requested, name))
     if os.path.exists(f"{STATE}/mode") and read(f"{STATE}/mode") == name:
         print(f"{read(f'{STATE}/connector')}: {name} already")
         return
@@ -188,6 +222,22 @@ def plug(mode):
     print(f"{connector}: {name}")
 
 
+def wait_for_release(card_connector, timeout=3.0):
+    """Wait until no CRTC drives the connector. A compositor torn down while
+    it still flips on the fake display can leave amdgpu with a flip that
+    never completes, and every later flip on that CRTC then fails; unplug
+    first and let it move off."""
+    card, connector = card_connector.split("-", 1)
+    state = f"/sys/kernel/debug/dri/{card.removeprefix('card')}/state"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if re.search(rf"^connector\[\d+\]: {re.escape(connector)}\n\tcrtc=\(null\)$", read(state), re.M):
+            return True
+        time.sleep(0.05)
+    print(f"{card_connector}: still driven after {timeout:g}s", file=sys.stderr)
+    return False
+
+
 def unplug():
     if not os.path.exists(f"{STATE}/connector"):
         return
@@ -195,6 +245,7 @@ def unplug():
     write(f"{DRM}/{connector}/status", "detect")
     write(f"{debugfs_dir(connector)}/edid_override", "reset")
     hotplug(connector)
+    wait_for_release(connector)
     for name in ("connector", "status", "mode"):
         if os.path.exists(f"{STATE}/{name}"):
             os.unlink(f"{STATE}/{name}")
@@ -203,7 +254,7 @@ def unplug():
 
 def main(argv):
     if len(argv) == 2 and argv[0] == "edid":
-        sys.stdout.buffer.write(edid(*parse_mode(argv[1])))
+        sys.stdout.buffer.write(edid(*fit_mode(*parse_mode(argv[1]))))
     elif len(argv) == 2 and argv[0] == "plug":
         plug(argv[1])
     elif argv == ["unplug"]:

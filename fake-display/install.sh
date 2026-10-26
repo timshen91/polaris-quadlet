@@ -6,9 +6,12 @@ set -eu
 user="${1:-${SUDO_USER:?pass the user Polaris runs as}}"
 here="$(dirname "$0")"
 install -D -m 0755 "$here/polaris-fake-display" /etc/polaris-fake-display/polaris-fake-display
-install -m 0644 "$here/polaris-fake-display@.service" "$here/polaris-fake-display-unplug.service" /etc/systemd/system/
+install -m 0644 "$here/polaris-fake-display@.service" "$here/polaris-fake-display-unplug.service" \
+  "$here/polaris-fake-display-idle.timer" /etc/systemd/system/
 install -m 0644 "$here/70-polaris-fake-display.rules" /etc/udev/rules.d/
 sed "s/@USER@/$user/g" "$here/50-polaris-fake-display.rules" > /etc/polkit-1/rules.d/50-polaris-fake-display.rules
+install -D -m 0644 "$here/gamescope-session-unplug.conf" /etc/systemd/user/gamescope-session.service.d/50-polaris-fake-display.conf
 systemctl daemon-reload
+systemctl --user --machine="$user@" daemon-reload || true
 udevadm control --reload
 echo "installed for $user"

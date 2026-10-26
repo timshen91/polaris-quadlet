@@ -3,4 +3,6 @@ Description=Fake display at %i for Polaris
 
 [Service]
 Type=oneshot
+# A stream is starting: cancel a pending idle unplug.
+ExecStartPre=-/usr/bin/systemctl stop polaris-fake-display-idle.timer
 ExecStart=/etc/polaris-fake-display/polaris-fake-display plug %i
