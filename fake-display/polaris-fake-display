@@ -22,6 +22,7 @@ import math
 import os
 import re
 import sys
+import time
 
 STATE = "/run/polaris-fake-display"
 DRM = "/sys/class/drm"
@@ -143,6 +144,29 @@ def hotplug(card_connector):
     write(f"{DRM}/{card}/uevent", f"change {uuid} HOTPLUG=1")
 
 
+def wait_for_scanout(card_connector, width, height, refresh, timeout=5.0):
+    """Wait until the compositor drives the connector at this mode.
+
+    The hotplug returns before the compositor modesets, so a capture started
+    right after it would still see the old output and then renegotiate
+    mid-stream. Polaris's prep commands are synchronous; returning only once
+    the mode is live lets its capture start at the right size.
+    """
+    card, connector = card_connector.split("-", 1)
+    state = f"/sys/kernel/debug/dri/{card.removeprefix('card')}/state"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = read(state)
+        crtc = re.search(rf"^connector\[\d+\]: {re.escape(connector)}\n\tcrtc=(\S+)$", text, re.M)
+        if crtc:
+            block = re.search(rf"^crtc\[\d+\]: {re.escape(crtc.group(1))}\n(?:\t.*\n)*?\tmode: \"{width}x{height}\": {refresh} ", text, re.M)
+            if block and "\tactive=1\n" in block.group(0):
+                return True
+        time.sleep(0.05)
+    print(f"{card_connector}: not scanning out {width}x{height}@{refresh} after {timeout:g}s", file=sys.stderr)
+    return False
+
+
 def plug(mode):
     width, height, refresh = parse_mode(mode)
     name = f"{width}x{height}@{refresh}"
@@ -160,6 +184,7 @@ def plug(mode):
     write(f"{STATE}/status", status)
     write(f"{STATE}/mode", name)
     hotplug(connector)
+    wait_for_scanout(connector, width, height, refresh)
     print(f"{connector}: {name}")
 
 

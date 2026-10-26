@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Shen <timshen91@gmail.com>
+Date: Mon, 26 Oct 2026 08:50:48 +0900
+Subject: [PATCH 2/2] Run resume commands for the resuming client, before its
+ capture starts
+
+State (resume) commands ran with the environment built when the app
+launched, so POLARIS_CLIENT_WIDTH/HEIGHT/FPS (and NAME) described the
+launching client, and they ran on a detached thread beside the new session's
+capture. A command that sizes a display for the stream therefore sized it for
+the wrong client, and when it did not, its change landed mid-stream and
+forced a capture reinitialization.
+
+Refresh those variables from the resuming session's stream configuration, and
+run the commands when that session starts, before its audio and video threads,
+waiting for them; resume() then skips them.
+---
+ src/process.cpp | 108 ++++++++++++++++++++++++++++++++----------------
+ src/process.h   |  16 +++++++
+ src/stream.cpp  |  13 ++++++
+ 3 files changed, 101 insertions(+), 36 deletions(-)
+
+diff --git a/src/process.cpp b/src/process.cpp
+index 6e0e6d9..419d9e0 100644
+--- a/src/process.cpp
++++ b/src/process.cpp
+@@ -9942,54 +9942,90 @@ namespace proc {
+     return 0;
+   }
+ 
+-  void proc_t::resume() {
++  void proc_t::update_client_display(const std::string &device_name, int width, int height, int framerate) {
+     auto &sync = session_lifecycle_sync();
+     std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+-    BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
+-    _client_session_report_recorded = false;
+-    _client_session_report_recorded_at = {};
+-    _client_session_report_recorded_unique_id.clear();
+-
+-    if (!_app.state_cmds.empty()) {
+-      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
++    _env["POLARIS_CLIENT_NAME"] = device_name;
++    _env["POLARIS_CLIENT_WIDTH"] = std::to_string(width);
++    _env["POLARIS_CLIENT_HEIGHT"] = std::to_string(height);
++    _env["POLARIS_CLIENT_RENDER_WIDTH"] = std::to_string(width);
++    _env["POLARIS_CLIENT_RENDER_HEIGHT"] = std::to_string(height);
++    _env["POLARIS_CLIENT_FPS"] = std::format("{:.3f}", static_cast<double>(framerate));
++  }
+ 
+-        _env["POLARIS_APP_STATUS"] = "RESUMING";
++  namespace {
++    // Run an app's state (resume) commands in order, stopping at the first that fails.
++    void run_resume_commands(std::vector<proc::cmd_t> cmd_list, const std::string &app_working_dir, boost::process::v1::environment env) {
++      env["POLARIS_APP_STATUS"] = "RESUMING";
+ 
+-        std::error_code ec;
+-        auto _state_resume_it = std::begin(cmd_list);
++      std::error_code ec;
++      auto _state_resume_it = std::begin(cmd_list);
+ 
+-        for (; _state_resume_it != std::end(cmd_list); ++_state_resume_it) {
+-          auto &cmd = *_state_resume_it;
++      for (; _state_resume_it != std::end(cmd_list); ++_state_resume_it) {
++        auto &cmd = *_state_resume_it;
+ 
+-          // Skip empty commands
+-          if (cmd.do_cmd.empty()) {
+-            continue;
+-          }
++        // Skip empty commands
++        if (cmd.do_cmd.empty()) {
++          continue;
++        }
+ 
+-          boost::filesystem::path working_dir = app_working_dir.empty() ?
+-                                                  find_working_directory(cmd.do_cmd, _env) :
+-                                                  boost::filesystem::path(app_working_dir);
+-          BOOST_LOG(info) << "Executing Resume Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
+-          auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, nullptr, ec, nullptr);
++        boost::filesystem::path working_dir = app_working_dir.empty() ?
++                                                find_working_directory(cmd.do_cmd, env) :
++                                                boost::filesystem::path(app_working_dir);
++        BOOST_LOG(info) << "Executing Resume Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
++        auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, env, nullptr, ec, nullptr);
+ 
+-          if (ec) {
+-            BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
+-            break;
+-          }
++        if (ec) {
++          BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
++          break;
++        }
+ 
+-          // Unbounded on purpose: this loop runs on a detached thread that
+-          // holds no lock, so a long-running resume command blocks nothing.
+-          child.wait();
++        // Unbounded on purpose: this holds no lock, so a long-running resume command
++        // blocks only its caller (resume()'s detached thread, or a starting session).
++        child.wait();
+ 
+-          auto ret = child.exit_code();
+-          if (ret != 0 && ec != std::errc::permission_denied) {
+-            BOOST_LOG(error) << '[' << cmd.do_cmd << "] failed with code ["sv << ret << ']';
+-            break;
+-          }
++        auto ret = child.exit_code();
++        if (ret != 0 && ec != std::errc::permission_denied) {
++          BOOST_LOG(error) << '[' << cmd.do_cmd << "] failed with code ["sv << ret << ']';
++          break;
+         }
+-      });
++      }
++    }
++  }  // namespace
+ 
+-      exec_thread.detach();
++  void proc_t::run_resume_commands_before_capture() {
++    auto &sync = session_lifecycle_sync();
++    std::vector<cmd_t> cmd_list;
++    std::string working_dir;
++    boost::process::v1::environment env;
++    {
++      std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
++      if (_app.state_cmds.empty()) {
++        return;
++      }
++      cmd_list = _app.state_cmds;
++      working_dir = _app.working_dir;
++      env = _env;
++    }
++    // Without the lifecycle lock, as on resume()'s thread: only the caller waits.
++    run_resume_commands(std::move(cmd_list), working_dir, std::move(env));
++    std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
++    _resume_commands_ran = true;
++  }
++
++  void proc_t::resume() {
++    auto &sync = session_lifecycle_sync();
++    std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
++    BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
++    _client_session_report_recorded = false;
++    _client_session_report_recorded_at = {};
++    _client_session_report_recorded_unique_id.clear();
++
++    if (std::exchange(_resume_commands_ran, false)) {
++      return;
++    }
++    if (!_app.state_cmds.empty()) {
++      std::thread(run_resume_commands, _app.state_cmds, _app.working_dir, _env).detach();
+     }
+   }
+ 
+diff --git a/src/process.h b/src/process.h
+index b3504f7..1e5458a 100644
+--- a/src/process.h
++++ b/src/process.h
+@@ -958,6 +958,21 @@ namespace proc {
+       bool require_exact_token
+     );
+     boost::process::v1::environment get_env();
++    /**
++     * @brief Point the client display variables at a resuming client's stream.
++     *
++     * The app's environment is built at launch, so without this the state commands a resume
++     * runs would see the launching client's mode, not that of the client resuming it.
++     */
++    void update_client_display(const std::string &device_name, int width, int height, int framerate);
++    /**
++     * @brief Run the state (resume) commands now and wait for them, before capture starts.
++     *
++     * A resume command may change what the session captures, such as a display sized for the
++     * client. Run beside capture, as resume() does, that change lands mid-stream and forces a
++     * reinitialization; run first, capture starts on the final output. resume() then skips them.
++     */
++    void run_resume_commands_before_capture();
+     void resume();
+     void pause();
+     void terminate(bool immediate = false, bool needs_refresh = true);
+@@ -1103,6 +1118,7 @@ namespace proc {
+     std::shared_ptr<session_lifecycle_sync_t> _session_lifecycle_sync {std::make_shared<session_lifecycle_sync_t>()};
+     std::uint64_t _session_generation = 0;
+     bool _client_session_report_recorded = false;
++    bool _resume_commands_ran = false;  ///< run_resume_commands_before_capture() did resume()'s work
+     std::chrono::steady_clock::time_point _client_session_report_recorded_at {};
+     std::string _client_session_report_recorded_unique_id;
+   };
+diff --git a/src/stream.cpp b/src/stream.cpp
+index fbacb54..8ebbcfb 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -3123,6 +3123,19 @@ namespace stream {
+         session.config.monitor.bitrate
+       );
+ 
++      // The first session onto a running app resumes it. Resume commands may change what this
++      // session captures (a display sized for this client), so run them before capture starts
++      // rather than beside it, where the change would land mid-stream.
++      if (uses_host_process(session) && running_host_sessions.load(std::memory_order_relaxed) == 0) {
++        proc::proc.update_client_display(
++          session.device_name,
++          session.config.monitor.width,
++          session.config.monitor.height,
++          session.config.monitor.framerate
++        );
++        proc::proc.run_resume_commands_before_capture();
++      }
++
+       session.audioThread = std::thread {audioThread, &session};
+       session.videoThread = std::thread {videoThread, &session};
+ 
