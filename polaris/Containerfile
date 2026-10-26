@@ -49,7 +49,8 @@ RUN cd src \
       cmake -S . -B ../arch-pkgbuild -DPOLARIS_CONFIGURE_PKGBUILD=ON -DPOLARIS_CONFIGURE_ONLY=ON \
  && cd ../arch-pkgbuild \
  && sed -i "s|^  'git'\$|  'git'\n  'go'|; s|^      -D POLARIS_ASSETS_DIR=\"share/polaris\"\$|&\n      -D POLARIS_ENABLE_BROWSER_STREAM=ON|" PKGBUILD \
- && MAKEFLAGS="-j$(nproc)" makepkg --nodeps --noconfirm --nocheck
+ && MAKEFLAGS="-j$(nproc)" makepkg --nodeps --noconfirm --nocheck \
+ && mkdir ../out && mv polaris-[0-9]*.pkg.tar.zst ../out/
 
 FROM ${ARCH_IMAGE}
 
@@ -57,11 +58,12 @@ FROM ${ARCH_IMAGE}
 # gamescope_stream); the session itself runs on the host. Intel and AMD
 # VAAPI/QSV/Vulkan userspace for the encoder. (NVIDIA would need nvidia-utils
 # matching the host's driver version, and a CUDA build; not covered here.)
-COPY --from=build /home/builder/arch-pkgbuild/ /tmp/pkg/
+# Only the package: the build tree beside it is gigabytes.
+COPY --from=build /home/builder/out/ /tmp/pkg/
 RUN pacman -Syu --noconfirm \
       mesa intel-media-driver vpl-gpu-rt vulkan-intel vulkan-radeon \
       gamescope \
- && pacman -U --noconfirm $(ls /tmp/pkg/polaris-[0-9]*.pkg.tar.zst) \
+ && pacman -U --noconfirm /tmp/pkg/polaris-[0-9]*.pkg.tar.zst \
  && rm -rf /tmp/pkg \
  && pacman -Scc --noconfirm
 
